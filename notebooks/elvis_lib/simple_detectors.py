@@ -8,11 +8,12 @@ from ._base_detector import _BaseDetector
 
 class RawActivationsDetector(_BaseDetector):
     def __init__(self, classifier_model, layer_names=None, n_components=20,
-                 random_state=None):
+                 n_jobs=1, random_state=None):
         super(RawActivationsDetector, self).__init__(classifier_model,
                                                      layer_names=layer_names,
                                                      n_components=n_components,
                                                      random_state=random_state)
+        self.n_jobs = n_jobs
 
     def transform(self, X):
         """
@@ -35,7 +36,7 @@ class RawActivationsDetector(_BaseDetector):
             self.final = OneClassSVM()
         else:
             self.final = LogisticRegressionCV(random_state=self.random_state,
-                                              cv=3)
+                                              cv=3, n_jobs=self.n_jobs)
         print("Fitting %s.." % self.final)
         self.final.fit(codes, y)
         return self

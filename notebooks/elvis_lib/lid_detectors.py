@@ -1,23 +1,25 @@
 import numpy as np
 
-from skelarn.base import BaseEstimator
-from sklearn.linear_model import LinearRegression
+from sklearn.base import BaseEstimator
 from sklearn.utils.validation import check_is_fitted
 from sklearn.neighbors import NearestNeighbors
 from sklearn.covariance import EllipticEnvelope
+from joblib import Parallel, delayed
 
 from ._base_detector import _BaseDetector
 
 
 class LIDDetector(_BaseDetector):
     def __init__(self, classifier_model, layer_names=None, n_neighbors=None,
-                 contamination=0., n_components=None, random_state=None):
+                 contamination=0., n_components=None, n_jobs=1,
+                 random_state=None):
         super(LIDDetector, self).__init__(classifier_model=classifier_model,
                                           layer_names=layer_names,
                                           n_components=n_components,
                                           random_state=random_state)
         self.n_neighbors = n_neighbors
         self.contamination = contamination
+        self.n_jobs = n_jobs
 
     def _fit_knns(self, activations):
         self.knns_ = {}
@@ -50,24 +52,29 @@ class LIDDetector(_BaseDetector):
     def _check_is_fitted(self):
         return check_is_fitted(self, attributes=["knns_", "lids_"])
 
+    def _compute_lids_for_layer(self, layer_name, layer_activations,
+                                remove_zero_dist):
+        print("Computing LIDs for layer '%s'..." % layer_name)
+        dist, _ = self.knns_[layer_name].kneighbors(layer_activations)
+
+        # handle zeros
+        if remove_zero_dist:
+            zero_mask = dist == 0.
+            if zero_mask.sum():
+                dist[zero_mask] = dist[~zero_mask].min()
+
+        return np.reciprocal(np.log(dist[:, -1][:, None] / dist).mean(axis=-1))
+
     def _compute_lids(self, activations, remove_zero_dist=False):
         """
         Compute the Local Intrinsic Dimension (LID) of each sample in a batch
         """
-        lids = {}
-        for layer_name, layer_activations in activations.items():
-            print("Computing LIDs for layer '%s'..." % layer_name)
-            dist, _ = self.knns_[layer_name].kneighbors(layer_activations)
-
-            # handle zeros
-            if remove_zero_dist:
-                zero_mask = dist == 0.
-                if zero_mask.sum():
-                    dist[zero_mask] = dist[~zero_mask].min()
-
-            lids[layer_name] = np.reciprocal(
-                np.log(dist[:, -1][:, None] / dist).mean(axis=-1))
-        return lids
+        lids = Parallel(n_jobs=self.n_jobs)(
+            delayed(self._compute_lids_for_layer)(layer_name,
+                                                  layer_activations,
+                                                  remove_zero_dist)
+            for layer_name, layer_activations in activations.items())
+        return dict(zip(activations.keys(), lids))
 
     def predict(self, X):
         self._check_is_fitted()
@@ -96,7 +103,7 @@ def intrinsic_dim_sample_wise(X, k=5, dist=None):
     dist = dist[:, 1:(k+1)]
     assert dist.shape == (X.shape[0], k)
     assert np.all(dist > 0)
-    d = np.log(dist[:, k - 1: k] / dist[:, 0:k - 1])
+    d = np.log(dist[:, k - 1: k] / dist[:, :k - 1])
     d = d.sum(axis=1) / (k - 2)
     d = 1. / d
     intdim_sample = d
@@ -155,10 +162,11 @@ class LocalIntrinsicDimensionMLE(BaseEstimator):
 
 class LIDDetectorBickel(LIDDetector):
     def __init__(self, classifier_model, layer_names=None, k1=10, k2=20,
-                 contamination=0.):
+                 contamination=0., n_jobs=1):
         super(LIDDetectorBickel, self).__init__(classifier_model,
                                                 layer_names=layer_names,
-                                                contamination=contamination)
+                                                contamination=contamination,
+                                                n_jobs=n_jobs)
         self.k1 = k1
         self.k2 = k2
 
@@ -176,66 +184,7 @@ class LIDDetectorBickel(LIDDetector):
             self.lids_[layer_name] = lider.intrinsic_dims_
         return self
 
-    def _compute_lids(self, activations, remove_zero_dist=False):
-        lids = {}
-        for layer_name, layer_activations in activations.items():
-            print("Computing LIDs for layer %s..." % layer_name)
-            lids[layer_name] = self.liders_[layer_name].predict(
-                layer_activations)
-        return lids
-
-
-class LocalIntrinsicDimensionMLE2NN(LocalIntrinsicDimensionMLE):
-    def __init__(self, confidence=.95, **kwargs):
-        super(LocalIntrinsicDimensionMLE2NN, self).__init__(**kwargs)
-        self.confidence = confidence
-
-    def _compute_mus(self, X):
-        dist, _ = self.knn_.kneighbors(X)
-        assert dist.shape[1] == 3
-        dist = dist[:, 1:]
-        return dist[:, 1] / dist[:, 0]  # ratio of distance from 2nd nearest to
-                                        # nearest point
-
-    def _preprocess(self, X):
-        if self.preprocessor is None:
-            return X
-        return self.preprocessor(X)
-
-    def _check_is_fitted(self):
-        return check_is_fitted(self, attributes=["intrinsic_dim_"])
-
-    def fit(self, X):
-        X = self._preprocess(X)
-        self.knn_ = NearestNeighbors(n_neighbors=2+1, n_jobs=1,
-                                     algorithm='ball_tree').fit(X)
-        self.mus_ = self._compute_mus(X)
-        self.mus_.sort()
-        self.Fmus_ = np.arange(1, len(X) + 1) / float(len(X))
-        self.xx_ = np.log(self.mus_)
-        self.yy_ = -np.log(1 - self.Fmus_)
-        lr = LinearRegression(fit_intercept=False)
-        self.intrinsic_dim_ = lr.fit(self.xx_[:-1][:, None],
-                                     self.yy_[:-1]).coef_[0]
-        return self
-
-    def predict(self, X):
-        raise NotImplementedError
-
-
-class LIDDetector2NN(LIDDetector):
-    def fit(self, X):
-        X = self._get_activations(X)
-        self.lid2nn_ = LocalIntrinsicDimensionMLE2NN().fit(X)
-        self.intrinsic_dim_ = self.lid2nn_.intrinsic_dim_
-        self.xx_ = self.lid2nn_.xx_
-        self.yy_ = self.lid2nn_.yy_
-
-        self.cutoff_ = 1.5 * self.intrinsic_dim_
-
-        if False:
-            self.knn_ = NearestNeighbors(n_neighbors=self.k, n_jobs=1,
-                                         algorithm='ball_tree').fit(X)
-        else:
-            self.knn_ = self.lid2nn_.knn_
-        return self
+    def _compute_lids_for_layer(self, layer_name, layer_activations,
+                                remove_zero_dist=False):
+        print("Computing LIDs for layer '%s'..." % layer_name)
+        return self.liders_[layer_name].predict(layer_activations)
